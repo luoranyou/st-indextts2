@@ -17,12 +17,29 @@
         // VN format: [角色|表情]|「对话」 or [旁白]|描述
         vnRegex: '^\\[([^\\]|]+)(?:\\|[^\\]]*)?\\]\\|(.+)$',
         voiceMap: {}, // { cardId: { characterName: "voice.wav" } }
+        // 输出正则过滤：在文本进入 TTS 处理流程前，按顺序执行正则替换
+        regexFilters: [
+            { enabled: true, regex: '/<think>[\\s\\S]*?<\\/think>\\n?/g', replacement: '' }
+        ],
         promptInjection: {
             enabled: false,
-            content: `描写任何角色（主要角色、NPC、路人）说话时，必须严格遵守格式，对话单开一行：
-       格式：[角色名|表情]|「对话内容」
-     - **严禁**只写名字（如 [萧凡]），**严禁**漏掉表情。
-     - **强制规则**：若无特定表情，必须使用 [角色名|通常]「对话内容」。`,
+            content: `描写任何角色（主要角色、NPC、路人）说话时，必须严格遵守以下格式，对话单开一行：
+格式：[角色名|表情关键词][喜,怒,哀,惧,厌恶,低落,惊喜,平静]|「对话内容」
+
+**情感向量规则：**
+- 八个维度依次为：喜、怒、哀、惧、厌恶、低落、惊喜、平静。
+- 数值范围 0 到 1.4。0 = 该情感完全缺失，数值越大表现越强烈。
+- 根据角色当前情绪状态如实填写，用逗号分隔。
+
+**示例：**
+[萧凡|微笑][0.8,0,0,0,0,0,0.3,0.5]|「你终于来了，我等你很久了。」
+[林婉|恐惧][0,0,0.4,1.2,0,0.3,0,0]|「不……不要过来！」
+[旁白|通常][0,0,0,0,0,0,0,1.0]|「夜风穿过走廊，带来远处隐约的钟声。」
+
+**强制规则：**
+- **严禁**省略表情关键词（如只写 [萧凡]）。
+- **严禁**省略情感向量。若无特定情绪波动，使用平静为主：[角色名|通常][0,0,0,0,0,0,0,1.0]|「对话」。
+- 每句对话必须独占一行。`,
             position: "depth",
             depth: 4,
             role: "system"
@@ -675,6 +692,68 @@
         return null;
     }
 
+    // ==================== Regex Filter Engine ====================
+    /**
+     * 解析字符串格式的正则表达式（如 /pattern/flags）并创建 RegExp 对象
+     * @param {string} regexStr - 字符串格式正则，如 "/<think>[\s\S]*?<\/think>/g"
+     * @returns {RegExp|null} 解析成功返回 RegExp，失败返回 null
+     */
+    function parseRegexString(regexStr) {
+        if (!regexStr || typeof regexStr !== 'string') return null;
+        const trimmed = regexStr.trim();
+        // 匹配 /pattern/flags 格式
+        const match = trimmed.match(/^\/(.+)\/([gimsuy]*)$/);
+        if (match) {
+            try {
+                return new RegExp(match[1], match[2]);
+            } catch (e) {
+                console.warn('[IndexTTS2] Invalid regex pattern:', regexStr, e.message);
+                return null;
+            }
+        }
+        // 不是 /pattern/flags 格式，尝试直接作为 pattern 使用
+        try {
+            return new RegExp(trimmed, 'g');
+        } catch (e) {
+            console.warn('[IndexTTS2] Invalid regex (raw):', regexStr, e.message);
+            return null;
+        }
+    }
+
+    /**
+     * 应用所有已启用的正则过滤规则到输入文本
+     * 在 collectVNLinesFromMessage / injectInlineButtons 提取 textContent 后第一时间调用
+     * @param {string} text - 原始文本内容
+     * @returns {string} 经过所有过滤规则处理后的文本
+     */
+    function applyRegexFilters(text) {
+        if (!text) return text;
+        const settings = getSettings();
+        const filters = settings.regexFilters;
+        if (!Array.isArray(filters) || filters.length === 0) return text;
+
+        let result = text;
+        for (let i = 0; i < filters.length; i++) {
+            const filter = filters[i];
+            if (!filter || !filter.enabled) continue;
+            try {
+                const regex = parseRegexString(filter.regex);
+                if (!regex) {
+                    console.warn(`[IndexTTS2] Regex filter #${i + 1} skipped: invalid pattern`);
+                    continue;
+                }
+                const before = result;
+                result = result.replace(regex, filter.replacement || '');
+                if (before !== result) {
+                    console.debug(`[IndexTTS2] Regex filter #${i + 1} applied, removed ${before.length - result.length} chars`);
+                }
+            } catch (e) {
+                console.warn(`[IndexTTS2] Regex filter #${i + 1} execution error:`, e.message);
+                // 单条规则错误不影响其他规则和整个流程
+            }
+        }
+        return result;
+    }
 
     function getMergedCharacterList() {
         const characters = new Set();
@@ -1277,8 +1356,9 @@
 
         const voiceMap = getVoiceMap();
 
-        // Get text content and split by lines
-        const textContent = mesText.innerText || '';
+        // Get text content, apply regex filters, then split by lines
+        const rawTextContent = mesText.innerText || '';
+        const textContent = applyRegexFilters(rawTextContent);
         const lines = textContent.split('\n');
 
         // Find all VN-format lines and their positions
@@ -1400,10 +1480,38 @@
         } catch (e) {
             textContent = mesText.innerText || '';
         }
+        // 应用正则过滤（剥离思维链等垃圾内容）
+        textContent = applyRegexFilters(textContent);
         textContent = (textContent || '').replace(/\r/g, '\n');
 
         if (mode === 'audiobook') {
-            const normalized = textContent.replace(/\r/g, '');
+            // ====== 源码优先拦截：直接从酒馆原始消息数组提取最纯净的文本 ======
+            let rawSource = '';
+            try {
+                const mesId = getMessageId(msg);
+                const ctx = getContext();
+                if (ctx && ctx.chat && mesId !== null && mesId !== undefined) {
+                    const chatEntry = ctx.chat[parseInt(mesId)];
+                    if (chatEntry && typeof chatEntry.mes === 'string') {
+                        rawSource = chatEntry.mes;
+                        console.debug('[IndexTTS2][Audiobook] Source-first: extracted raw text from chat[' + mesId + '], length=' + rawSource.length);
+                    }
+                }
+            } catch (e) {
+                console.warn('[IndexTTS2][Audiobook] Source-first extraction failed, falling back to DOM:', e.message);
+            }
+
+            // 兜底：如果从上下文取不到，回退到 DOM 文本（已经过之前的正则过滤）
+            if (!rawSource) {
+                rawSource = textContent;
+                console.debug('[IndexTTS2][Audiobook] Fallback: using DOM textContent');
+            }
+
+            // ====== 正则过滤：在拆句前立即剥离 <think> 等垃圾内容 ======
+            const filteredText = applyRegexFilters(rawSource);
+            const normalized = (filteredText || '').replace(/\r/g, '');
+
+            // ====== 句子拆分流程 ======
             const roughSegments = normalized.split(/\n+/);
             const segments = [];
             for (const seg of roughSegments) {
@@ -1419,7 +1527,7 @@
             }
             for (const seg of segments) {
                 const trimmed = seg.trim();
-                if (!trimmed) continue;
+                if (!trimmed) continue; // 静默跳过空字符串
                 result.push({ text: trimmed, character: 'Narrator', voice: settings.defaultVoice });
             }
             return result;
@@ -2551,6 +2659,18 @@
                             </div>
                         </div>
 
+                        <!-- 模块：输出正则过滤 -->
+                        <div class="indextts-setting-module">
+                            <div class="indextts-module-header">🔽 输出正则过滤</div>
+                            <div style="color:#aaa; font-size:12px; margin-bottom:8px; line-height:1.5;">
+                                对生成结果按顺序执行所有已启用的正则替换，可用于剥离 &lt;think&gt; 思维链等内容
+                            </div>
+                            <div id="indextts-regex-filter-list"></div>
+                            <button class="menu_button" id="indextts-regex-add" style="margin-top:6px; width:100%;">
+                                <i class="fa-solid fa-plus"></i> 新建正则过滤
+                            </button>
+                        </div>
+
                     </div>
                 </div>
             </div>
@@ -2860,6 +2980,105 @@
                 if (window.toastr) window.toastr.success(`已删除预设 "${current}"`);
             };
         }
+
+        // ==================== Module: Regex Filter Bindings ====================
+        const regexListEl = panel.querySelector('#indextts-regex-filter-list');
+        const regexAddBtn = panel.querySelector('#indextts-regex-add');
+
+        /** 渲染正则过滤列表 UI */
+        function renderRegexFilterList() {
+            if (!regexListEl) return;
+            const s = getSettings();
+            if (!Array.isArray(s.regexFilters)) s.regexFilters = [];
+            const filters = s.regexFilters;
+
+            if (filters.length === 0) {
+                regexListEl.innerHTML = '<div style="color:#666; font-size:12px; text-align:center; padding:8px 0;">暂无过滤规则</div>';
+                return;
+            }
+
+            regexListEl.innerHTML = filters.map((f, idx) => `
+                <div class="indextts-regex-row" data-idx="${idx}" style="border:1px solid #444; border-radius:6px; padding:10px; margin-bottom:8px; background:rgba(255,255,255,0.03);">
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+                        <label style="display:flex; align-items:center; gap:6px; cursor:pointer; font-size:13px;">
+                            <input type="checkbox" class="indextts-regex-enabled" data-idx="${idx}" ${f.enabled ? 'checked' : ''}>
+                            启用 <span style="color:#888;">#${idx + 1}</span>
+                        </label>
+                        <div class="indextts-regex-del menu_button" data-idx="${idx}" title="删除此规则" style="padding:2px 6px; cursor:pointer;">
+                            <i class="fa-solid fa-trash"></i>
+                        </div>
+                    </div>
+                    <div style="margin-bottom:6px;">
+                        <label style="font-size:12px; color:#999; display:block; margin-bottom:3px;">正则表达式 (含 /pattern/flags)</label>
+                        <input type="text" class="indextts-regex-pattern text_pole" data-idx="${idx}" value="${(f.regex || '').replace(/"/g, '&quot;')}" placeholder="/<think>[\\s\\S]*?<\\/think>/g" style="width:100%;">
+                    </div>
+                    <div>
+                        <label style="font-size:12px; color:#999; display:block; margin-bottom:3px;">替换为</label>
+                        <input type="text" class="indextts-regex-replacement text_pole" data-idx="${idx}" value="${(f.replacement || '').replace(/"/g, '&quot;')}" placeholder="留空表示删除匹配内容" style="width:100%;">
+                    </div>
+                </div>
+            `).join('');
+
+            // Bind events for each row
+            regexListEl.querySelectorAll('.indextts-regex-enabled').forEach(cb => {
+                cb.onchange = (e) => {
+                    const idx = parseInt(e.target.dataset.idx);
+                    const s = getSettings();
+                    if (s.regexFilters[idx]) {
+                        s.regexFilters[idx].enabled = e.target.checked;
+                        saveSettings();
+                    }
+                };
+            });
+
+            regexListEl.querySelectorAll('.indextts-regex-pattern').forEach(input => {
+                input.onchange = (e) => {
+                    const idx = parseInt(e.target.dataset.idx);
+                    const s = getSettings();
+                    if (s.regexFilters[idx]) {
+                        s.regexFilters[idx].regex = e.target.value;
+                        saveSettings();
+                    }
+                };
+            });
+
+            regexListEl.querySelectorAll('.indextts-regex-replacement').forEach(input => {
+                input.onchange = (e) => {
+                    const idx = parseInt(e.target.dataset.idx);
+                    const s = getSettings();
+                    if (s.regexFilters[idx]) {
+                        s.regexFilters[idx].replacement = e.target.value;
+                        saveSettings();
+                    }
+                };
+            });
+
+            regexListEl.querySelectorAll('.indextts-regex-del').forEach(btn => {
+                btn.onclick = (e) => {
+                    const idx = parseInt(e.currentTarget.dataset.idx);
+                    const s = getSettings();
+                    if (s.regexFilters[idx] !== undefined) {
+                        s.regexFilters.splice(idx, 1);
+                        saveSettings();
+                        renderRegexFilterList();
+                    }
+                };
+            });
+        }
+
+        // 新建正则过滤规则按钮
+        if (regexAddBtn) {
+            regexAddBtn.onclick = () => {
+                const s = getSettings();
+                if (!Array.isArray(s.regexFilters)) s.regexFilters = [];
+                s.regexFilters.push({ enabled: true, regex: '', replacement: '' });
+                saveSettings();
+                renderRegexFilterList();
+            };
+        }
+
+        // 初始渲染正则列表
+        renderRegexFilterList();
 
         // Initial UI check
         updatePathUI();
