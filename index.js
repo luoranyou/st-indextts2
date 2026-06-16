@@ -13,6 +13,7 @@
         parsingMode: 'gal', // 'gal' | 'audiobook'
         enableInline: true, // 启用行内增强渲染
         autoInference: false, // 回复后自动推理
+        autoPlayStreaming: false, // 回复后边生成边播放（流式）
         cacheImportPath: '\\\\SillyTavern\\\\data\\\\TTSsound',
         // VN format: [角色|表情]|「对话」 or [旁白]|描述
         vnRegex: '^\\[([^\\]|]+)(?:\\|[^\\]]*)?\\]\\|(.+)$',
@@ -264,7 +265,8 @@
         // New Global State
         playlist: null, // [{ blobUrl, duration, startOffset, ... }]
         totalDuration: 0,
-        controller: null // { seek: fn, play: fn, pause: fn }
+        controller: null, // { seek: fn, play: fn, pause: fn }
+        _streamAborted: false, // 流式播放中断标志
     };
     const inferenceLocks = new Set(); // 正在推理中的 mesId 集合
 
@@ -295,7 +297,9 @@
             try { currentPlayback.audio.pause(); } catch (e) { }
         }
         currentPlayback = {
-            audio: null, msg: null, mesId: null, index: -1, sessionId: null, stop: function () {
+            audio: null, msg: null, mesId: null, index: -1, sessionId: null, _streamAborted: false,
+            playlist: null, totalDuration: 0, controller: null,
+            stop: function () {
                 if (this.audio) {
                     try {
                         this.audio.pause();
@@ -1322,7 +1326,16 @@
         const playBtn = group.querySelector('.indextts-play');
         const inferBtn = group.querySelector('.indextts-infer');
         if (playBtn) {
-            playBtn.onclick = e => { e.stopPropagation(); playMessageQueue(msg, playBtn); };
+            playBtn.onclick = e => {
+                e.stopPropagation();
+                const settings = getSettings();
+                // 若启用流式播放，使用 streamMessageAudios（边生成边播放）
+                if (settings.autoPlayStreaming) {
+                    streamMessageAudios(msg, playBtn);
+                } else {
+                    playMessageQueue(msg, playBtn);
+                }
+            };
             setupMiniPlayerHover(playBtn);
         }
         if (inferBtn) {
@@ -2164,6 +2177,8 @@
         function hide() {
             if (container) {
                 container.classList.remove('visible');
+                // 通知流式播放循环停止
+                currentPlayback._streamAborted = true;
                 if (globalController) {
                     globalController.pause();
                 }
@@ -2271,6 +2286,342 @@
             } else {
                 const inferBtn = msg.querySelector('.indextts-infer');
                 if (inferBtn) inferBtn.classList.remove('indextts-inferring');
+            }
+        }
+    }
+
+    // ==================== Streaming Play: Generate & Play Concurrently ====================
+    /**
+     * 流式边生成边播放：生成第一句后立即播放，同时在后台预生成下一句。
+     * 播放完当前句后，下一句已预生成完毕，可无缝衔接。
+     * 所有生成的音频都会存入 audioCache[mesId] 供后续回放。
+     * @param {Element} msg - 消息 DOM 元素
+     * @param {Element|null} triggerBtn - 触发按钮（用于 UI 状态切换）
+     */
+    async function streamMessageAudios(msg, triggerBtn) {
+        if (!msg) return;
+        const mesId = getMessageId(msg);
+        if (!mesId) return;
+
+        // 推理锁：防止重复启动流式播放
+        if (inferenceLocks.has(mesId)) {
+            if (window.toastr) window.toastr.warning('正在处理中，请稍候...');
+            return;
+        }
+        inferenceLocks.add(mesId);
+
+        // 按钮 UI 状态
+        let iconEl = null;
+        let originalIconClass = '';
+        if (triggerBtn) {
+            triggerBtn.classList.add('disabled');
+            iconEl = triggerBtn.querySelector('i');
+            if (iconEl) {
+                originalIconClass = iconEl.className;
+                iconEl.className = 'fa-solid fa-spinner fa-spin';
+            }
+        } else {
+            // 自动推理时的 UI 反馈
+            const inferBtn = msg.querySelector('.indextts-infer');
+            if (inferBtn) inferBtn.classList.add('indextts-inferring');
+        }
+
+        // 创建唯一会话 ID，用于校验播放过程中是否被新会话打断
+        const streamSessionId = Date.now();
+        currentPlayback.sessionId = streamSessionId;
+        currentPlayback._streamAborted = false;
+
+        try {
+            const lines = collectVNLinesFromMessage(msg);
+            const validLines = lines.filter(l => l.voice);
+            const unvoicedCount = lines.length - validLines.length;
+
+            if (!lines.length) {
+                if (window.toastr) window.toastr.warning('未发现可播放的台词');
+                return;
+            }
+            if (!validLines.length) {
+                if (window.toastr) window.toastr.warning('发现角色对话但均未配置配音，请先绑定音色');
+                return;
+            }
+
+            // 清理前一次播放
+            if (currentPlayback.stop) {
+                currentPlayback.stop();
+            } else if (currentPlayback.audio) {
+                try { currentPlayback.audio.pause(); } catch (e) { }
+            }
+            clearPlayingInMessage(currentPlayback.msg);
+            clearPlayingInMessage(msg);
+
+            // 初始化缓存数组
+            if (!audioCache[mesId]) audioCache[mesId] = [];
+
+            const playlist = [];
+            let totalDuration = 0;
+            let currentAudio = null;
+
+            // 辅助：从 blobUrl 获取音频时长
+            const loadDuration = (blobUrl) => new Promise((resolve) => {
+                const a = new Audio(blobUrl);
+                a.onloadedmetadata = () => resolve(a.duration || 0);
+                a.onerror = () => resolve(0);
+                setTimeout(() => resolve(0), 1000);
+            });
+
+            // 辅助：将 audio record 转为 cacheEntry，并推入 audioCache / playlist
+            const cacheAndPrepare = async (line, record) => {
+                const blobUrl = URL.createObjectURL(record.blob);
+                const entry = {
+                    text: line.text,
+                    character: line.character,
+                    voice: line.voice,
+                    hash: record.hash,
+                    blobUrl,
+                };
+                audioCache[mesId].push(entry);
+
+                const dur = await loadDuration(blobUrl);
+                const playlistEntry = {
+                    ...entry,
+                    index: playlist.length,
+                    duration: dur,
+                    startOffset: totalDuration,
+                };
+                playlist.push(playlistEntry);
+                totalDuration += dur;
+
+                return playlistEntry;
+            };
+
+            // 辅助：播放已生成好的单条 track，返回 Promise（track 结束时 resolve）
+            const playPreparedTrack = (entry) => new Promise((resolve) => {
+                // 会话校验 —— 新会话启动后旧 track 不再播放
+                if (currentPlayback.sessionId !== streamSessionId) { resolve(); return; }
+                if (currentPlayback._streamAborted) { resolve(); return; }
+
+                if (currentAudio) {
+                    currentAudio.pause();
+                    currentAudio.onended = null;
+                    currentAudio.onerror = null;
+                }
+
+                const audio = new Audio(entry.blobUrl);
+                currentAudio = audio;
+
+                // 更新全局状态
+                currentPlayback.audio = audio;
+                currentPlayback.msg = msg;
+                currentPlayback.mesId = mesId;
+                currentPlayback.index = entry.index;
+                currentPlayback.playlist = playlist;
+                currentPlayback.totalDuration = totalDuration;
+
+                // 音量 & 速度
+                const settings = getSettings();
+                const vol = parseFloat(settings.volume || 1.0);
+                audio.volume = Math.max(0, Math.min(1, vol));
+                audio.playbackRate = parseFloat(settings.speed || 1.0);
+
+                // 行内高亮
+                const encT = utf8ToBase64(entry.text);
+                const encC = utf8ToBase64(entry.character || '');
+                clearPlayingInMessage(msg);
+                setLinePlayingByEncoded(msg, encT, encC, true);
+
+                // 绑定迷你播放器（全局模式）
+                attachMiniPlayerToAudio(audio, true);
+
+                // 浮动窗口信息
+                const avatarEl = msg.querySelector('.avatar img');
+                let displayChar = entry.character || 'Unknown';
+                if (displayChar.toLowerCase() === 'narrator' && avatarEl) {
+                    const nameEl = msg.querySelector('.ch_name');
+                    if (nameEl) displayChar = nameEl.textContent.trim();
+                }
+                TTSPlayerWindow.updateInfo({
+                    name: displayChar,
+                    text: entry.text,
+                    avatarUrl: avatarEl ? avatarEl.src : null,
+                });
+
+                // 时间更新 → 浮动窗口进度条
+                audio.addEventListener('timeupdate', () => {
+                    if (currentPlayback.sessionId !== streamSessionId) return;
+                    const elapsed = entry.startOffset + audio.currentTime;
+                    TTSPlayerWindow.updateProgress(elapsed, totalDuration);
+                });
+                audio.addEventListener('play', () => {
+                    if (currentPlayback.sessionId === streamSessionId) {
+                        TTSPlayerWindow.updatePlayState(true);
+                    }
+                });
+                audio.addEventListener('pause', () => {
+                    if (currentPlayback.sessionId === streamSessionId) {
+                        TTSPlayerWindow.updatePlayState(false);
+                    }
+                    // 流式中断：用户暂停/关闭悬浮窗时 signal abort
+                    if (currentPlayback._streamAborted) {
+                        setLinePlayingByEncoded(msg, encT, encC, false);
+                        resolve();
+                    }
+                });
+
+                audio.onended = () => {
+                    setLinePlayingByEncoded(msg, encT, encC, false);
+                    resolve();
+                };
+                audio.onerror = () => {
+                    console.warn('[IndexTTS2] Streaming track error for:', entry.text);
+                    setLinePlayingByEncoded(msg, encT, encC, false);
+                    resolve();
+                };
+
+                audio.play().catch((e) => {
+                    console.warn('[IndexTTS2] Streaming autoplay blocked:', e);
+                    setLinePlayingByEncoded(msg, encT, encC, false);
+                    resolve();
+                });
+            });
+
+            // ========== 流水线主循环 ==========
+            // 维护两个 Promise：当前播放 Promise + 下一句预生成 Promise
+            let nextGenPromise = null;
+            let nextGenEntry = null;
+
+            // 预生成第一句
+            nextGenPromise = (async () => {
+                try {
+                    const record = await ensureAudioRecord({
+                        text: validLines[0].text,
+                        character: validLines[0].character,
+                        voice: validLines[0].voice,
+                        emotion: validLines[0].emotion,
+                    });
+                    if (record) {
+                        nextGenEntry = await cacheAndPrepare(validLines[0], record);
+                    }
+                } catch (e) {
+                    console.warn('[IndexTTS2] Stream generate error (line 0):', e);
+                }
+            })();
+
+            // 显示浮动播放器（先显示占位控制器，后续 track 播放时会更新）
+            TTSPlayerWindow.show(msg, {
+                seek: (percent) => {
+                    // 流式播放不支持精确跳转，给出提示
+                    if (window.toastr) window.toastr.info('流式播放中暂不支持跳转');
+                },
+                pause: () => {
+                    currentPlayback._streamAborted = true;
+                    if (currentAudio) currentAudio.pause();
+                },
+                play: () => {
+                    if (currentAudio) currentAudio.play().catch(() => {});
+                },
+            });
+
+            const settings = getSettings();
+
+            for (let i = 0; i < validLines.length; i++) {
+                // 检查中断标志
+                if (currentPlayback._streamAborted) break;
+                if (currentPlayback.sessionId !== streamSessionId) break;
+
+                // 等待当前句生成完毕
+                await nextGenPromise;
+                const entry = nextGenEntry;
+                nextGenPromise = null;
+                nextGenEntry = null;
+
+                if (!entry) {
+                    // 当前句生成失败，跳过并启动下一句
+                    if (window.toastr) window.toastr.warning(`第 ${i + 1} 句生成失败，已跳过`);
+                    if (i + 1 < validLines.length) {
+                        const nextLine = validLines[i + 1];
+                        const nextIdx = i + 1;
+                        nextGenPromise = (async () => {
+                            try {
+                                const record = await ensureAudioRecord({
+                                    text: nextLine.text,
+                                    character: nextLine.character,
+                                    voice: nextLine.voice,
+                                    emotion: nextLine.emotion,
+                                });
+                                if (record) {
+                                    nextGenEntry = await cacheAndPrepare(nextLine, record);
+                                }
+                            } catch (e) {
+                                console.warn(`[IndexTTS2] Stream generate error (line ${nextIdx}):`, e);
+                            }
+                        })();
+                    }
+                    continue;
+                }
+
+                // 启动下一句预生成（如果还有）
+                if (i + 1 < validLines.length) {
+                    const nextLine = validLines[i + 1];
+                    const nextIdx = i + 1;
+                    nextGenPromise = (async () => {
+                        try {
+                            const record = await ensureAudioRecord({
+                                text: nextLine.text,
+                                character: nextLine.character,
+                                voice: nextLine.voice,
+                                emotion: nextLine.emotion,
+                            });
+                            if (record) {
+                                nextGenEntry = await cacheAndPrepare(nextLine, record);
+                            }
+                        } catch (e) {
+                            console.warn(`[IndexTTS2] Stream generate error (line ${nextIdx}):`, e);
+                        }
+                    })();
+                }
+
+                // 播放当前句（等待播放完毕）
+                await playPreparedTrack(entry);
+
+                // 当前句播完后再检查一次中断
+                if (currentPlayback._streamAborted) break;
+            }
+
+            // ========== 收尾 ==========
+            // 标记播放按钮为已缓存状态
+            const playBtn = msg.querySelector('.indextts-play');
+            if (playBtn && audioCache[mesId] && audioCache[mesId].length > 0) {
+                playBtn.classList.add('indextts-prepared');
+            }
+
+            // 正常完成或中断时隐藏浮动窗口
+            TTSPlayerWindow.hide();
+
+            // Toast 提示
+            if (!currentPlayback._streamAborted && audioCache[mesId].length > 0) {
+                const cachedCount = audioCache[mesId].filter(r => r.hash && true).length;
+                let msgStr = `流式播放完成，共 ${cachedCount} 句`;
+                if (unvoicedCount > 0) {
+                    msgStr += `，${unvoicedCount} 句未配置配音已跳过`;
+                }
+                if (window.toastr) window.toastr.success(msgStr);
+            }
+
+        } finally {
+            inferenceLocks.delete(mesId);
+            // 恢复按钮 UI
+            if (triggerBtn) {
+                triggerBtn.classList.remove('disabled');
+                if (iconEl && originalIconClass) {
+                    iconEl.className = originalIconClass;
+                }
+            } else {
+                const inferBtn = msg.querySelector('.indextts-infer');
+                if (inferBtn) inferBtn.classList.remove('indextts-inferring');
+            }
+            // 清理会话
+            if (currentPlayback.sessionId === streamSessionId) {
+                currentPlayback._streamAborted = false;
             }
         }
     }
@@ -2626,6 +2977,10 @@
                                 <label for="indextts-auto-inference">回复后自动推理</label>
                                 <input type="checkbox" id="indextts-auto-inference"${settings.autoInference === true ? ' checked' : ''}>
                             </div>
+                             <div class="indextts-setting-row checkbox-row">
+                                <label for="indextts-auto-play-streaming">回复后边生成边播放（流式）</label>
+                                <input type="checkbox" id="indextts-auto-play-streaming"${settings.autoPlayStreaming === true ? ' checked' : ''}>
+                            </div>
                             <div class="indextts-setting-row">
                                 <label>默认朗读音色</label>
                                 <input type="text" id="indextts-voice" class="text_pole" value="${settings.defaultVoice}">
@@ -2726,6 +3081,7 @@
         };
         bindCheckbox('#indextts-enable-inline', 'enableInline', true);
         bindCheckbox('#indextts-auto-inference', 'autoInference', false);
+        bindCheckbox('#indextts-auto-play-streaming', 'autoPlayStreaming', false);
 
         // Voice
         const voiceInput = panel.querySelector('#indextts-voice');
@@ -3268,8 +3624,15 @@
                                     if (all.length) msg = all[all.length - 1];
                                 }
                                 if (msg) {
-                                    console.log('[IndexTTS2] Auto-inferring for message', mesId);
-                                    await inferMessageAudios(msg, null, true); // silent = true
+                                    if (settings.autoPlayStreaming) {
+                                        // 流式模式：边生成边播放
+                                        console.log('[IndexTTS2] Auto-streaming for message', mesId);
+                                        await streamMessageAudios(msg, null);
+                                    } else {
+                                        // 批量模式：静默推理，用户手动点击播放
+                                        console.log('[IndexTTS2] Auto-inferring for message', mesId);
+                                        await inferMessageAudios(msg, null, true); // silent = true
+                                    }
                                 }
                             }
                         }, 500);
