@@ -1524,45 +1524,58 @@
             const filteredText = applyRegexFilters(rawSource);
             const normalized = (filteredText || '').replace(/\r/g, '');
 
-            // ====== 句子拆分流程 ======
-            const roughSegments = normalized.split(/\n+/);
-            const segments = [];
-            for (const seg of roughSegments) {
-                let buf = '';
-                for (const ch of seg) {
-                    buf += ch;
-                    if (/[。！？!?]/.test(ch)) {
-                        segments.push(buf);
-                        buf = '';
-                    }
-                }
-                if (buf.trim()) segments.push(buf);
-            }
-            for (const seg of segments) {
-                const trimmed = seg.trim();
-                if (!trimmed) continue; // 静默跳过空字符串
-                result.push({ text: trimmed, character: 'Narrator', voice: settings.defaultVoice });
+            // ====== 段落拆分：以空白行分隔，每个段落作为一个整体生成 ======
+            const paragraphs = normalized.split(/\n\n+/);
+            for (const para of paragraphs) {
+                // 清理段落内换行和首尾空白
+                const cleaned = para.replace(/\n/g, '').trim();
+                if (!cleaned) continue;
+                result.push({ text: cleaned, character: 'Narrator', voice: settings.defaultVoice });
             }
             return result;
         }
 
-        // GAL 模式：解析 VN 格式，未配置配音也纳入结果并打日志
-        for (const line of textContent.split('\n')) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            const parsed = parseVNLine(trimmed);
-            if (parsed && !parsed.isAction) {
+        // GAL 模式：按段落分组，同段落内同角色的连续台词合并为一个 TTS 片段
+        const paragraphs = textContent.split(/\n\s*\n/);
+        for (const para of paragraphs) {
+            const lines = para.split('\n');
+            let currentGroup = null; // { text, character, voice, emotion }
+
+            const flushGroup = () => {
+                if (currentGroup && currentGroup.text.trim()) {
+                    result.push(currentGroup);
+                }
+                currentGroup = null;
+            };
+
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+                const parsed = parseVNLine(trimmed);
+                if (!parsed || parsed.isAction) continue;
+
                 const voice = voiceMap[parsed.character];
                 if (voice === undefined || voice === null || voice === '') {
                     console.warn('[IndexTTS2] 角色未配置配音，将跳过推理:', parsed.character);
                 }
-                result.push({
-                    text: parsed.dialogue,
-                    character: parsed.character,
-                    voice: voice !== undefined && voice !== null && voice !== '' ? voice : undefined,
-                    emotion: parsed.emotion || null,
-                });
+
+                if (currentGroup && currentGroup.character === parsed.character) {
+                    // 同角色同段落：合并对话文本
+                    currentGroup.text += '，' + parsed.dialogue;
+                    // voice/emotion 沿用第一句的（最准确的情绪来自首句）
+                } else {
+                    // 角色切换：先推入上一组，再开启新组
+                    flushGroup();
+                    currentGroup = {
+                        text: parsed.dialogue,
+                        character: parsed.character,
+                        voice: voice !== undefined && voice !== null && voice !== '' ? voice : undefined,
+                        emotion: parsed.emotion || null,
+                    };
+                }
             }
+            // 段落结束时强制推入
+            flushGroup();
         }
         return result;
     }
