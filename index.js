@@ -11,6 +11,7 @@
         speed: 1.0,
         volume: 1.0,
         parsingMode: 'gal', // 'gal' | 'audiobook'
+        generationGranularity: 'paragraph', // 'sentence' | 'paragraph' | 'message' —— 生成粒度
         enableInline: true, // 启用行内增强渲染
         autoInference: false, // 回复后自动推理
         autoPlayStreaming: false, // 回复后边生成边播放（流式）
@@ -1524,58 +1525,114 @@
             const filteredText = applyRegexFilters(rawSource);
             const normalized = (filteredText || '').replace(/\r/g, '');
 
-            // ====== 段落拆分：以空白行分隔，每个段落作为一个整体生成 ======
-            const paragraphs = normalized.split(/\n\n+/);
-            for (const para of paragraphs) {
-                // 清理段落内换行和首尾空白
-                const cleaned = para.replace(/\n/g, '').trim();
-                if (!cleaned) continue;
-                result.push({ text: cleaned, character: 'Narrator', voice: settings.defaultVoice });
+            // ====== 粒度拆分：sentence / paragraph / message ======
+            const granularity = settings.generationGranularity || 'paragraph';
+
+            if (granularity === 'message') {
+                // 整条消息一次性生成
+                const cleaned = normalized.replace(/\n/g, '').trim();
+                if (cleaned) {
+                    result.push({ text: cleaned, character: 'Narrator', voice: settings.defaultVoice });
+                }
+            } else if (granularity === 'sentence') {
+                // 逐句拆分
+                const roughSegments = normalized.split(/\n+/);
+                for (const seg of roughSegments) {
+                    let buf = '';
+                    for (const ch of seg) {
+                        buf += ch;
+                        if (/[。！？!?]/.test(ch)) {
+                            const trimmed = buf.trim();
+                            if (trimmed) result.push({ text: trimmed, character: 'Narrator', voice: settings.defaultVoice });
+                            buf = '';
+                        }
+                    }
+                    const trimmed = buf.trim();
+                    if (trimmed) result.push({ text: trimmed, character: 'Narrator', voice: settings.defaultVoice });
+                }
+            } else {
+                // 按段落拆分（默认）
+                const paragraphs = normalized.split(/\n\n+/);
+                for (const para of paragraphs) {
+                    const cleaned = para.replace(/\n/g, '').trim();
+                    if (cleaned) {
+                        result.push({ text: cleaned, character: 'Narrator', voice: settings.defaultVoice });
+                    }
+                }
             }
             return result;
         }
 
-        // GAL 模式：按段落分组，同段落内同角色的连续台词合并为一个 TTS 片段
-        const paragraphs = textContent.split(/\n\s*\n/);
-        for (const para of paragraphs) {
-            const lines = para.split('\n');
-            let currentGroup = null; // { text, character, voice, emotion }
+        // ====== GAL 模式 ======
+        const granularity = settings.generationGranularity || 'paragraph';
 
-            const flushGroup = () => {
-                if (currentGroup && currentGroup.text.trim()) {
-                    result.push(currentGroup);
-                }
-                currentGroup = null;
-            };
-
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed) continue;
-                const parsed = parseVNLine(trimmed);
-                if (!parsed || parsed.isAction) continue;
-
+        // 辅助函数：将解析后的 VN 行按角色分组、合并对话文本
+        const groupVNByCharacter = (vnLines) => {
+            const groups = [];
+            vnLines.forEach((parsed) => {
                 const voice = voiceMap[parsed.character];
                 if (voice === undefined || voice === null || voice === '') {
                     console.warn('[IndexTTS2] 角色未配置配音，将跳过推理:', parsed.character);
                 }
-
-                if (currentGroup && currentGroup.character === parsed.character) {
-                    // 同角色同段落：合并对话文本
-                    currentGroup.text += '，' + parsed.dialogue;
-                    // voice/emotion 沿用第一句的（最准确的情绪来自首句）
+                const last = groups.length > 0 ? groups[groups.length - 1] : null;
+                if (last && last.character === parsed.character) {
+                    last.text += '，' + parsed.dialogue;
                 } else {
-                    // 角色切换：先推入上一组，再开启新组
-                    flushGroup();
-                    currentGroup = {
+                    groups.push({
                         text: parsed.dialogue,
                         character: parsed.character,
                         voice: voice !== undefined && voice !== null && voice !== '' ? voice : undefined,
                         emotion: parsed.emotion || null,
-                    };
+                    });
+                }
+            });
+            return groups;
+        };
+
+        if (granularity === 'message') {
+            // 整条消息：全部 VN 台词按角色合并
+            const allParsed = [];
+            for (const line of textContent.split('\n')) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+                const parsed = parseVNLine(trimmed);
+                if (parsed && !parsed.isAction) allParsed.push(parsed);
+            }
+            groupVNByCharacter(allParsed).forEach(g => result.push(g));
+
+        } else if (granularity === 'sentence') {
+            // 逐句：每一行 VN 台词单独生成
+            for (const line of textContent.split('\n')) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+                const parsed = parseVNLine(trimmed);
+                if (parsed && !parsed.isAction) {
+                    const voice = voiceMap[parsed.character];
+                    if (voice === undefined || voice === null || voice === '') {
+                        console.warn('[IndexTTS2] 角色未配置配音，将跳过推理:', parsed.character);
+                    }
+                    result.push({
+                        text: parsed.dialogue,
+                        character: parsed.character,
+                        voice: voice !== undefined && voice !== null && voice !== '' ? voice : undefined,
+                        emotion: parsed.emotion || null,
+                    });
                 }
             }
-            // 段落结束时强制推入
-            flushGroup();
+
+        } else {
+            // 按段落（默认）：同一段落内同角色的连续台词合并
+            const paragraphs = textContent.split(/\n\s*\n/);
+            for (const para of paragraphs) {
+                const vnInPara = [];
+                for (const line of para.split('\n')) {
+                    const trimmed = line.trim();
+                    if (!trimmed) continue;
+                    const parsed = parseVNLine(trimmed);
+                    if (parsed && !parsed.isAction) vnInPara.push(parsed);
+                }
+                groupVNByCharacter(vnInPara).forEach(g => result.push(g));
+            }
         }
         return result;
     }
@@ -2982,6 +3039,14 @@
                                     <option value="audiobook"${settings.parsingMode === 'audiobook' ? ' selected' : ''}>听书模式（全文朗读）</option>
                                 </select>
                             </div>
+                            <div class="indextts-setting-row">
+                                <label>生成粒度</label>
+                                <select id="indextts-generation-granularity" class="text_pole">
+                                    <option value="sentence"${settings.generationGranularity === 'sentence' ? ' selected' : ''}>逐句生成</option>
+                                    <option value="paragraph"${settings.generationGranularity !== 'sentence' && settings.generationGranularity !== 'message' ? ' selected' : ''}>按段落生成</option>
+                                    <option value="message"${settings.generationGranularity === 'message' ? ' selected' : ''}>整条消息一次性生成</option>
+                                </select>
+                            </div>
                             <div class="indextts-setting-row checkbox-row">
                                 <label for="indextts-enable-inline">启用行内增强渲染</label>
                                 <input type="checkbox" id="indextts-enable-inline"${settings.enableInline !== false ? ' checked' : ''}>
@@ -3080,6 +3145,7 @@
             }
         };
         bindSelect('#indextts-parsing-mode', 'parsingMode');
+        bindSelect('#indextts-generation-granularity', 'generationGranularity');
 
         const bindCheckbox = (id, field, needRefresh = false) => {
             const el = panel.querySelector(id);
