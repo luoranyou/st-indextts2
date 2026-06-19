@@ -857,9 +857,14 @@
                 isCached: false
             };
 
-            // 持久化保存
+            // 持久化保存到 IndexedDB
             AudioStorage.saveAudio(record).catch(e => {
                 console.warn('[IndexTTS2] saveAudio failed:', e);
+            });
+
+            // 同步写入本地目录（若已配置且有权限）
+            saveRecordToLocalDir(record).catch(e => {
+                console.warn('[IndexTTS2] Local dir save skipped:', e.message || e);
             });
 
             return record;
@@ -3615,6 +3620,34 @@
         }
     }
 
+    /**
+     * 将单条音频记录写入本地缓存目录（若已配置且有权限）。
+     * 静默失败：目录未配置 / 无权限 / 写入失败 均只打日志，不影响主流程。
+     */
+    async function saveRecordToLocalDir(record) {
+        try {
+            const handle = LocalRepo.getHandle();
+            if (!handle) return; // 未配置本地目录
+            const hasPerm = await LocalRepo.requestPermission();
+            if (!hasPerm) return; // 无读写权限
+
+            const safeChar = (record.character || 'voice').slice(0, 16);
+            const previewText = (record.text || '').slice(0, 10).replace(/\s/g, '');
+            const shortHash = (record.hash || 'hash').slice(0, 6);
+            const rawName = `[${safeChar}]_${previewText}_${shortHash}.wav`;
+            const fileName = rawName.replace(/[\\/:*?"<>|]/g, '_');
+
+            const fileHandle = await handle.getFileHandle(fileName, { create: true });
+            const writable = await fileHandle.createWritable();
+            await writable.write(record.blob);
+            await writable.close();
+            console.debug('[IndexTTS2] Local dir saved:', fileName);
+        } catch (e) {
+            // 静默失败：权限失效、磁盘满、文件名冲突等
+            throw e; // 由调用方 .catch 统一处理
+        }
+    }
+
     async function exportAudioCacheToFolder(providedHandle) {
         if (!AudioStorage || !AudioStorage.getAllAudios) return;
         if (!window.showDirectoryPicker) {
@@ -3803,22 +3836,36 @@
     }
 
     // ==================== Initialize ====================
-    function init() {
+    async function init() {
         console.log('[IndexTTS2] v12 Initializing...');
         const loadedSettings = getSettings(); // Ensure settings exist
         console.log('[IndexTTS2] Loaded settings:', loadedSettings);
-        LocalRepo.init();
+        await LocalRepo.init();
         setupEventListeners();
         setInterval(polling, 2000);
         polling(); // Initial run
         console.log('[IndexTTS2] v12 Ready - Stable Edition');
 
+        // 延迟执行：给 UI 渲染留出时间，同时检查缓存状态
         setTimeout(async () => {
             try {
                 const list = await AudioStorage.getAllAudios();
                 if (!list || list.length === 0) {
-                    console.log('[IndexTTS2] 缓存池为空，建议在设置中执行「扫描本地目录同步至缓存」以节省推理算力');
-                    if (window.toastr) window.toastr.info('缓存池为空，建议执行「扫描本地目录同步至缓存」以节省算力');
+                    // IndexedDB 为空，尝试从本地目录自动导入
+                    const handle = LocalRepo.getHandle();
+                    if (handle) {
+                        const hasPerm = await LocalRepo.requestPermission();
+                        if (hasPerm) {
+                            console.log('[IndexTTS2] Cache empty, auto-importing from local directory...');
+                            await importFromLocalDirectory(handle);
+                        } else {
+                            console.log('[IndexTTS2] 缓存池为空，建议在设置中执行「扫描本地目录同步至缓存」以节省推理算力');
+                            if (window.toastr) window.toastr.info('缓存池为空，建议执行「扫描本地目录同步至缓存」以节省算力');
+                        }
+                    } else {
+                        console.log('[IndexTTS2] 缓存池为空，建议在设置中执行「扫描本地目录同步至缓存」以节省推理算力');
+                        if (window.toastr) window.toastr.info('缓存池为空，建议执行「扫描本地目录同步至缓存」以节省算力');
+                    }
                 }
             } catch (e) { }
         }, 800);
