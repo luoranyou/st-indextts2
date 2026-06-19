@@ -3,9 +3,17 @@
     const extensionFolderPath = `scripts/extensions/third-party/${extensionName}/`;
 
     // ==================== Default Settings ====================
+    // 使用 SillyTavern 宿主机地址而非硬编码 127.0.0.1，确保远程访问时也能正确连接
+    const detectedHost = (function () {
+        try {
+            const h = window.location.hostname;
+            if (!h || h === 'localhost' || h === '127.0.0.1' || h === '[::1]') return '127.0.0.1';
+            return h;
+        } catch (_) { return '127.0.0.1'; }
+    })();
     const defaultSettings = {
-        apiUrl: 'http://127.0.0.1:7880/v1/audio/speech',
-        cloningUrl: 'http://127.0.0.1:7880/api/v1/indextts2_cloning',
+        apiUrl: `http://${detectedHost}:7880/v1/audio/speech`,
+        cloningUrl: `http://${detectedHost}:7880/api/v1/indextts2_cloning`,
         model: 'index-tts2',
         defaultVoice: 'default.wav',
         speed: 1.0,
